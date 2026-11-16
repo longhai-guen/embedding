@@ -1,0 +1,6 @@
+# torch is installed separately by scripts/setup_env.sh from the CUDA-specific wheel index.
+sentence-transformers>=4.0   # CrossEncoder is an nn.Module (supports .half()) from 4.0
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2
+numpy
