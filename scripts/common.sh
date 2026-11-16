@@ -11,6 +11,8 @@ die() { echo "error: $*" >&2; exit 1; }
 # shellcheck disable=SC1091
 source "$ROOT/config.env"
 [[ "$STORAGE_ROOT" != /path/to/* ]] || die "edit STORAGE_ROOT in $ROOT/config.env (still the placeholder)"
+# Export so Python (hf, pip, torch, the server) sees them even if the conda env lacks these vars.
+export HF_HOME PIP_CACHE_DIR TORCH_HOME
 
 conda_init() {
   local base
@@ -36,4 +38,8 @@ activate_env() {
   set +u
   conda activate "$CONDA_ENV"
   set -u
+  # config.env wins over any cache vars stored on the conda env
+  # shellcheck disable=SC1091
+  source "$ROOT/config.env"
+  export HF_HOME PIP_CACHE_DIR TORCH_HOME
 }

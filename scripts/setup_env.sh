@@ -52,8 +52,11 @@ log "installing torch from the $cuda_tag wheel index"
 python -m pip install --upgrade pip
 python -m pip install torch --index-url "https://download.pytorch.org/whl/$cuda_tag"
 
-log "installing server requirements"
-python -m pip install -r "$ROOT/requirements.txt"
+# Pin the torch just installed: otherwise a dependency asking for a newer torch makes pip
+# replace it with a PyPI build for a newer CUDA than this driver supports.
+torch_ver="$(python -c 'import torch; print(torch.__version__)')"
+log "installing server requirements (keeping torch $torch_ver)"
+python -m pip install -r "$ROOT/requirements.txt" "torch==$torch_ver"
 
 log "checking torch can see GPU $GPU_INDEX"
 CUDA_VISIBLE_DEVICES="$GPU_INDEX" python - <<'EOF'
