@@ -11,6 +11,9 @@ if [[ -n "$SHARED_HUB" ]]; then
   [[ -d "$SHARED_HUB" ]] || die "SHARED_HUB $SHARED_HUB not found"
 fi
 
+# onnx/ is ~2.3 GB for bge-m3 and unused here
+EXCLUDE="onnx/*"
+
 if command -v hf >/dev/null 2>&1; then
   HF_DL=(hf download)
 else
@@ -22,9 +25,8 @@ for model in "$EMBED_MODEL" "$RERANK_MODEL"; do
   link="$HUB/$name"
 
   if [[ -z "$SHARED_HUB" ]]; then
-    # onnx/ is ~2.3 GB for bge-m3 and unused here
     log "$model: downloading into $HUB"
-    HF_HUB_CACHE="$HUB" "${HF_DL[@]}" "$model" --exclude "onnx/*"
+    HF_HUB_CACHE="$HUB" "${HF_DL[@]}" "$model" --exclude "$EXCLUDE"
     target="$link"
   else
     shared="$SHARED_HUB/$name"
@@ -32,7 +34,7 @@ for model in "$EMBED_MODEL" "$RERANK_MODEL"; do
       log "$model: already in shared hub, skipping download"
     else
       log "$model: downloading into shared hub"
-      HF_HUB_CACHE="$SHARED_HUB" "${HF_DL[@]}" "$model" --exclude "onnx/*"
+      HF_HUB_CACHE="$SHARED_HUB" "${HF_DL[@]}" "$model" --exclude "$EXCLUDE"
     fi
 
     if [[ -L "$link" ]]; then
@@ -51,10 +53,12 @@ for model in "$EMBED_MODEL" "$RERANK_MODEL"; do
   [[ "$broken" == 0 ]] || die "$model: $broken broken symlinks under $target/snapshots"
   log "$model: size $(du -shL "$target" | cut -f1), no broken links"
 
-  HF_HOME="$HF_HOME" python - "$model" <<'EOF'
+  # same exclude as the download, or newer huggingface_hub reports the skipped files as missing
+  HF_HOME="$HF_HOME" python - "$model" "$EXCLUDE" <<'EOF'
 import sys
 from huggingface_hub import snapshot_download
-print("  offline snapshot:", snapshot_download(sys.argv[1], local_files_only=True))
+path = snapshot_download(sys.argv[1], local_files_only=True, ignore_patterns=[sys.argv[2]])
+print("  offline snapshot:", path)
 EOF
 done
 
