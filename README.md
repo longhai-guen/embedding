@@ -1,7 +1,7 @@
 # embedding
 
 Self-hosted **BGE-M3** embeddings and **bge-reranker-v2-m3** reranking on a single GPU (a 12 GB card is plenty).
-One FastAPI process serves both models in fp16 (about 2.3 GB of weights), with an OpenAI-compatible
+One FastAPI process serves both models in fp16 (about 2.3 GB of weights per worker), with an OpenAI-compatible
 `/v1/embeddings` endpoint and a Cohere/Jina-style `/v1/rerank` endpoint.
 
 ```
@@ -13,6 +13,7 @@ scripts/setup_env.sh    one-time: conda env + caches on shared storage + torch +
 scripts/download_models.sh  download models (or link them from a shared hub), verify offline load
 scripts/serve.sh        start | stop | restart | status | logs
 scripts/test_client.py  smoke test (stdlib only)
+scripts/bench.py        load test: latency and req/s at several concurrency levels (stdlib only)
 logs/                   server.log and server.pid (gitignored)
 ```
 
@@ -83,6 +84,7 @@ On first start, an API key is generated in `~/.embed_api_key` (mode 600). The se
 
 ```bash
 python scripts/test_client.py
+python scripts/bench.py        # before and after changing WORKERS, USE_FP16, MERGE_ITEMS, RR_BATCH
 ```
 
 ## Using it from your laptop
@@ -119,7 +121,7 @@ All endpoints except `/health` need `Authorization: Bearer <key>`.
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
-| GET | `/health` | | status, models, device, GPU memory |
+| GET | `/health` | | status, models, device, GPU memory, jobs running / queued |
 | GET | `/v1/models` | | `bge-m3`, `bge-reranker-v2-m3` |
 | POST | `/v1/embeddings` | `input` (str or list), `encoding_format` (`float`/`base64`), `model` (ignored) | OpenAI embedding list, 1024-dim, L2-normalized |
 | POST | `/v1/rerank` | `query`, `documents` (str or `{"text"}`), `top_n`, `return_documents` | results sorted by `relevance_score` (sigmoid, 0–1) |
@@ -136,11 +138,26 @@ Embeddings are normalized, so cosine similarity equals the dot product. Inputs l
 | `MAX_EMB_LEN` | `8192` | bge-m3's full context |
 | `MAX_RR_LEN` | `1024` | per query+passage pair; up to 8192 |
 | `EMB_BATCH` / `RR_BATCH` | `16` / `32` | lower these if long inputs hit CUDA OOM |
-| `USE_FP16` | `1` | set `0` only on old GPUs with slow fp16 |
+| `USE_FP16` | `1` | Pascal cards (GTX 10xx) have no tensor cores: measure `0` with `scripts/bench.py` |
 | `MAX_INPUTS` | `2048` | texts/documents per request |
+| `WORKERS` | `2` | jobs on the GPU at once; each one holds a copy of both models (~2.3 GB + activations) |
+| `MERGE_ITEMS` | `256` | waiting requests of the same kind are merged into one job up to this many texts/pairs |
 
-GPU work is serialized with a lock, so peak memory is one batch at a time. For more throughput,
-send larger batches per request rather than many parallel requests.
+### How requests run
+
+`WORKERS` threads share the GPU, each with its own copy of both models (an HF tokenizer must not be used by two
+threads at once) and its own CUDA stream. All requests go into one queue. A free worker takes the oldest job and,
+with it, every waiting job of the same kind that fits in `MERGE_ITEMS`, so requests that arrive together run as one
+batch (40-document reranks from 6 clients become one 240-pair job).
+
+- Parallel requests are fine: up to `WORKERS` jobs run on the GPU at once, and while one worker tokenizes or copies
+  results on the CPU, another keeps the GPU busy.
+- Free VRAM is not free compute. Once the GPU's cores are busy, more workers only make each job slower. Raise
+  `WORKERS` one at a time and keep the value after which `scripts/bench.py` stops getting more req/s.
+- Memory: each worker adds ~2.3 GB of weights plus its activations (one batch of `RR_BATCH` / `EMB_BATCH`). On an
+  11 GB card, 2–3 workers fit with the default batch sizes; long embedding inputs (up to `MAX_EMB_LEN`) need more.
+- A request whose client disconnects (for example its timeout ran out) before a worker starts it is dropped, so a slow
+  queue does not fill up with work nobody waits for. A job already started runs to the end.
 
 ## Not covered
 
@@ -158,4 +175,7 @@ send larger batches per request rather than many parallel requests.
   `nvidia-smi` and set `TORCH_CUDA`.
 - `server exited during startup` → the last 40 lines of `logs/server.log` are printed. A common cause is the models
   not being in the cache yet (`scripts/download_models.sh`), because the server runs offline.
-- CUDA OOM on long documents → lower `EMB_BATCH` / `RR_BATCH` or `MAX_EMB_LEN`, then `scripts/serve.sh restart`.
+- CUDA OOM → lower `WORKERS`, `EMB_BATCH` / `RR_BATCH` or `MAX_EMB_LEN`, then `scripts/serve.sh restart`.
+- Slow answers under load → `scripts/serve.sh status` shows `jobs.queued` in the health JSON. A long queue with every worker running
+  means the GPU is at its limit (try one more `WORKERS`, or send less work per request); a long queue with idle
+  workers is a bug, check the log.
