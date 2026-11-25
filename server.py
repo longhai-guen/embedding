@@ -1,10 +1,8 @@
 """BGE-M3 embedding + bge-reranker-v2-m3 reranking server (one process, one GPU).
 
-``WORKERS`` worker threads share the GPU (``GPU_INDEX`` in config.env), each with its own copy of both models and its
-own CUDA stream, so that many jobs run on the GPU at once and one job's CPU work (tokenizing, copying results) overlaps
-another's GPU work. Requests go into one queue. A free worker takes the oldest job and, with it, the other waiting
-jobs of the same kind (up to ``MERGE_ITEMS`` texts or pairs), so requests that arrive together run as one batch.
-A job whose client has gone away before a worker starts it is dropped.
+Each visible GPU has one inference thread. The embedder is ready at startup, and the
+reranker loads on first use by default. Workers combine queued requests of the same
+kind and split them into length-sorted batches constrained by padded token count.
 
 Endpoints
   GET  /health          status, loaded models, GPUs, queue
@@ -17,7 +15,6 @@ Configured through env vars (scripts/serve.sh exports them from config.env).
 
 import asyncio
 import base64
-import json
 import logging
 import os
 import secrets
@@ -34,6 +31,7 @@ import numpy as np
 import torch
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
+from pydantic_core import to_json
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "BAAI/bge-m3")
@@ -45,7 +43,10 @@ RR_BATCH = int(os.environ.get("RR_BATCH", 32))
 USE_FP16 = os.environ.get("USE_FP16", "1") == "1"
 MAX_INPUTS = int(os.environ.get("MAX_INPUTS", 2048))
 MERGE_ITEMS = int(os.environ.get("MERGE_ITEMS", 256))  # texts / pairs per merged GPU job
-WORKERS = int(os.environ.get("WORKERS", 2))  # jobs on the GPU at once; each holds a copy of both models (~2.3 GB)
+BATCH_TOKENS = int(os.environ.get("BATCH_TOKENS", 8192))
+PRELOAD_RERANK = os.environ.get("PRELOAD_RERANK", "0") == "1"
+if min(BATCH_TOKENS, EMB_BATCH, RR_BATCH, MAX_EMB_LEN, MAX_RR_LEN) < 1:
+    raise ValueError("batch sizes, token budget and maximum lengths must be positive")
 DISCONNECT_POLL_S = 0.5
 
 EMBED_ID = EMBED_MODEL.split("/")[-1]    # "bge-m3"
@@ -67,50 +68,56 @@ API_KEY = _load_api_key()
 # ---------------------------------------------------------------- GPUs and the job queue
 
 
-def _token_counts(tokenizer, texts: List[str], max_len: int) -> List[int]:
-    return [len(ids) for ids in tokenizer(texts, truncation=True, max_length=max_len)["input_ids"]]
+def _batches(lengths: List[int], max_items: int):
+    """Group similar lengths. A single long input can use its full context."""
+    order = sorted(range(len(lengths)), key=lengths.__getitem__, reverse=True)
+    start = 0
+    while start < len(order):
+        longest = max(1, lengths[order[start]])
+        count = min(max_items, max(1, BATCH_TOKENS // longest))
+        yield order[start:start + count]
+        start += count
 
 
-class Replica:
-    """Both models on one GPU, for one worker thread only (an HF tokenizer must not be shared between threads)."""
+class ModelRunner:
+    """Owned by one worker, so model loading and inference on this GPU are serialized."""
 
-    def __init__(self, device: int):
+    def __init__(self, device: str):
         self.device = device
-        self.stream = None
-        self.name = torch.cuda.get_device_name(device)
-        self.embedder = SentenceTransformer(EMBED_MODEL, device=f"cuda:{device}")
+        self.model_kwargs = {"torch_dtype": torch.float16 if USE_FP16 else torch.float32}
+        self.embedder = SentenceTransformer(EMBED_MODEL, device=device, model_kwargs=self.model_kwargs.copy())
         self.embedder.max_seq_length = MAX_EMB_LEN
-        self.reranker = CrossEncoder(RERANK_MODEL, device=f"cuda:{device}", max_length=MAX_RR_LEN)
-        if USE_FP16:
-            self.embedder.half()
-            self.reranker.half()
-        self.embedder.eval()
-        self.reranker.eval()
         self.dim = self.embedder.get_sentence_embedding_dimension()
+        self.reranker = None
+        if PRELOAD_RERANK:
+            self._load_reranker()
 
-    def bind(self) -> None:
-        """In the worker thread: its own stream, so its kernels can run next to the other workers'."""
-        torch.cuda.set_device(self.device)
-        self.stream = torch.cuda.Stream(self.device)
+    def _load_reranker(self):
+        if self.reranker is None:
+            log.info("loading %s on %s", RERANK_MODEL, self.device)
+            self.reranker = CrossEncoder(
+                RERANK_MODEL, device=self.device, max_length=MAX_RR_LEN, model_kwargs=self.model_kwargs.copy()
+            )
+        return self.reranker
 
     def run(self, kind: str, items: list) -> tuple[np.ndarray, List[int]]:
-        """One output and one token count per item: an embedding per text, or a score per (query, document)."""
-        with torch.cuda.stream(self.stream):
-            return self._run(kind, items)
-
-    def _run(self, kind: str, items: list) -> tuple[np.ndarray, List[int]]:
         if kind == "embed":
-            vecs = self.embedder.encode(
-                items, batch_size=EMB_BATCH, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False
-            ).astype(np.float32)
-            return vecs, _token_counts(self.embedder.tokenizer, items, MAX_EMB_LEN)
-        # longest first, so each batch pads to a similar length
-        order = sorted(range(len(items)), key=lambda i: len(items[i][0]) + len(items[i][1]), reverse=True)
-        scores = np.empty(len(items), dtype=np.float32)
-        scores[order] = self.reranker.predict(
-            [items[i] for i in order], batch_size=RR_BATCH, convert_to_numpy=True, show_progress_bar=False
-        )  # sigmoid-activated, 0..1
-        return scores, _token_counts(self.reranker.tokenizer, [f"{q} {d}" for q, d in items], MAX_RR_LEN)
+            model, max_len, batch_size = self.embedder, MAX_EMB_LEN, EMB_BATCH
+            outputs = np.empty((len(items), self.dim), dtype=np.float32)
+        else:
+            model, max_len, batch_size = self._load_reranker(), MAX_RR_LEN, RR_BATCH
+            outputs = np.empty(len(items), dtype=np.float32)
+
+        # Tokenize pairs as pairs so the length includes the separator tokens.
+        lengths = model.tokenizer(items, truncation=True, max_length=max_len, return_length=True)["length"]
+        for indices in _batches(lengths, batch_size):
+            batch = [items[i] for i in indices]
+            kwargs = dict(batch_size=len(batch), convert_to_numpy=True, show_progress_bar=False)
+            if kind == "embed":
+                outputs[indices] = model.encode(batch, normalize_embeddings=True, **kwargs)
+            else:
+                outputs[indices] = model.predict(batch, **kwargs).reshape(-1)
+        return outputs, lengths
 
 
 @dataclass
@@ -121,16 +128,16 @@ class Job:
 
 
 class Scheduler:
-    """One job queue, one worker thread per replica."""
+    """One job queue, one worker thread per visible GPU."""
 
-    def __init__(self, replicas: list, merge_items: int):
-        self.replicas = replicas
+    def __init__(self, runners: list, merge_items: int):
+        self.runners = runners
         self.busy = 0
         self._merge_items = merge_items
         self._jobs: deque[Job] = deque()
         self._cond = threading.Condition()
         self._stopping = False
-        self._threads = [threading.Thread(target=self._work, args=(r,), daemon=True) for r in replicas]
+        self._threads = [threading.Thread(target=self._work, args=(r,), daemon=True) for r in runners]
         for t in self._threads:
             t.start()
 
@@ -174,15 +181,15 @@ class Scheduler:
                 self.busy += 1
                 return batch
 
-    def _work(self, replica) -> None:
-        replica.bind()
+    def _work(self, runner) -> None:
+        torch.cuda.set_device(runner.device)
         while (batch := self._take()) is not None:
             try:
-                outputs, tokens = replica.run(batch[0].kind, [x for job in batch for x in job.items])
+                outputs, tokens = runner.run(batch[0].kind, [x for job in batch for x in job.items])
             except Exception as exc:  # a failed batch fails its requests, not the worker
-                log.exception("%s batch of %d jobs failed on GPU %s", batch[0].kind, len(batch), replica.device)
+                log.exception("%s batch of %d jobs failed on GPU %s", batch[0].kind, len(batch), runner.device)
                 if "out of memory" in str(exc):
-                    log.error("CUDA out of memory: lower WORKERS, RR_BATCH / EMB_BATCH or MAX_EMB_LEN")
+                    log.error("CUDA out of memory: lower BATCH_TOKENS, or the maximum input length for a single item")
                 for job in batch:
                     job.future.set_exception(exc)
             else:
@@ -196,10 +203,10 @@ class Scheduler:
                     self.busy -= 1
 
 
-def load_replicas() -> list:
+def load_runners() -> list:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available; check CUDA_VISIBLE_DEVICES and the torch build")
-    return [Replica(device) for device in range(torch.cuda.device_count()) for _ in range(WORKERS)]
+    return [ModelRunner(f"cuda:{device}") for device in range(torch.cuda.device_count())]
 
 
 state: dict = {}
@@ -208,20 +215,23 @@ state: dict = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     t0 = time.time()
-    replicas = load_replicas()
-    state["scheduler"] = Scheduler(replicas, MERGE_ITEMS)
-    state["dim"] = replicas[0].dim
+    runners = load_runners()
+    state["scheduler"] = Scheduler(runners, MERGE_ITEMS)
+    state["dim"] = runners[0].dim
     log.info(
-        "loaded %s + %s on %s, %d workers, in %.1fs (fp16=%s, merge up to %d items, %.2f GiB allocated)",
-        EMBED_MODEL, RERANK_MODEL, replicas[0].name, len(replicas), time.time() - t0, USE_FP16, MERGE_ITEMS,
-        sum(torch.cuda.memory_allocated(d) for d in {r.device for r in replicas}) / 2**30,
+        "loaded %s on %d GPU(s) in %.1fs (preload_rerank=%s, fp16=%s, %.2f GiB allocated)",
+        EMBED_MODEL, len(runners), time.time() - t0, PRELOAD_RERANK, USE_FP16,
+        sum(torch.cuda.memory_allocated(d) for d in {r.device for r in runners}) / 2**30,
     )
     if API_KEY is None:
         log.warning("no API key configured: endpoints are open to anyone who can reach the port")
-    yield
-    state.pop("scheduler").stop()
-    state.clear()
-    torch.cuda.empty_cache()
+    try:
+        yield
+    finally:
+        state.pop("scheduler").stop()
+        state.clear()
+        runners.clear()
+        torch.cuda.empty_cache()
 
 
 app = FastAPI(title="bge-m3 embedding + rerank", lifespan=lifespan)
@@ -250,7 +260,7 @@ async def _run(request: Request, kind: str, items: list):
 
 async def _json(build, *args) -> Response:
     """Build and serialize the answer off the event loop: thousands of vectors take a while."""
-    body = await asyncio.to_thread(lambda: json.dumps(build(*args)))
+    body = await asyncio.to_thread(lambda: to_json(build(*args)))
     return Response(body, media_type="application/json")
 
 
@@ -283,11 +293,12 @@ class RerankRequest(BaseModel):
 @app.get("/health")
 def health():
     scheduler = state["scheduler"]
-    devices = sorted({r.device for r in scheduler.replicas})
+    devices = sorted({r.device for r in scheduler.runners})
     return {
         "status": "ok",
         "models": {"embedding": EMBED_MODEL, "rerank": RERANK_MODEL},
-        "device": scheduler.replicas[0].name,
+        "device": torch.cuda.get_device_name(devices[0]),
+        "reranker_loaded": {r.device: r.reranker is not None for r in scheduler.runners},
         "fp16": USE_FP16,
         "max_len": {"embedding": MAX_EMB_LEN, "rerank": MAX_RR_LEN},
         "gpu_mem_gib": {
@@ -295,10 +306,11 @@ def health():
             "reserved": round(sum(torch.cuda.memory_reserved(d) for d in devices) / 2**30, 2),
         },
         "jobs": {
-            "workers": len(scheduler.replicas),
+            "workers": len(scheduler.runners),
             "running": scheduler.busy,
             "queued": scheduler.queued,
             "merge_items": MERGE_ITEMS,
+            "batch_tokens": BATCH_TOKENS,
         },
     }
 
@@ -317,7 +329,7 @@ def list_models():
 
 def _embedding_answer(vecs: np.ndarray, n_tokens: int, encoding_format: str) -> dict:
     if encoding_format == "base64":
-        data = [base64.b64encode(v.astype("<f4").tobytes()).decode() for v in vecs]
+        data = [base64.b64encode(v.astype("<f4", copy=False)).decode() for v in vecs]
     else:
         data = [v.tolist() for v in vecs]
     return {

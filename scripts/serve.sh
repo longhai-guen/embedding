@@ -44,12 +44,13 @@ start() {
 
   export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU_INDEX"
   export HF_HUB_OFFLINE=1   # models are already in the cache; never hit the network at serve time
-  WORKERS="${WORKERS:-2}" MERGE_ITEMS="${MERGE_ITEMS:-256}"   # older config.env files lack them
-  export EMBED_MODEL RERANK_MODEL MAX_EMB_LEN MAX_RR_LEN EMB_BATCH RR_BATCH USE_FP16 MAX_INPUTS WORKERS MERGE_ITEMS
+  MERGE_ITEMS="${MERGE_ITEMS:-256}"
+  export BATCH_TOKENS="${BATCH_TOKENS:-8192}" PRELOAD_RERANK="${PRELOAD_RERANK:-0}"
+  export EMBED_MODEL RERANK_MODEL MAX_EMB_LEN MAX_RR_LEN EMB_BATCH RR_BATCH USE_FP16 MAX_INPUTS MERGE_ITEMS
   export EMBED_API_KEY_FILE="$API_KEY_FILE"
 
   cd "$ROOT"
-  echo "===== start $(date '+%F %T') gpu=$GPU_INDEX workers=$WORKERS $HOST:$PORT =====" >> "$LOG_FILE"
+  echo "===== start $(date '+%F %T') gpu=$GPU_INDEX batch_tokens=$BATCH_TOKENS preload_rerank=$PRELOAD_RERANK $HOST:$PORT =====" >> "$LOG_FILE"
   nohup python -m uvicorn server:app --host "$HOST" --port "$PORT" --workers 1 >> "$LOG_FILE" 2>&1 &
   echo $! > "$PID_FILE"
   log "started pid $!, loading models (log: $LOG_FILE)"
